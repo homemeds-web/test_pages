@@ -89,22 +89,24 @@
       validationTimeouts: { image: 1100, thumb: 900, poster: 900, video: 1300, vimeoOembed: 1500 },
       vimeoMetaRetryDelay: 3000,
       vimeoMetaRetryAttempts: 2,
-      // NEW: loop limits: 0 => infinite; >0 => number of loop cycles allowed before fallback to poster
-      loopLimits: { preview: 0, main: 0, lightbox: 0 }
+      // loop limits: 0 => infinite; >0 => number of preview cycles to allow
+      loopLimits: { preview: 0, main: 3, lightbox: 3 },
+      // NEW: default focused preview on first load (0-based index among validated items)
+      startIndex: 0
     }
   };
 
-  /* Editable gallery data (JSON-like) */
+  /* Editable gallery data (JSON-like). Vimeo item poster set to "media/image7.jpg" as requested */
   const GALLERY_DATA = [
     { type: "image", src: "media/image1.jpg", alt: "Sunlight over ridge" },
     { type: "image", src: "media/image2.jpg", alt: "Forest path" },
     { type: "image", src: "media/image3.jpg", alt: "City skyline" },
     { type: "video", src: "media/video2.mp4", poster: "media/image1.jpg", alt: "Local surfing clip" },
-    { type: "vimeo", src: "https://vimeo.com/1112464020", poster: "media/my-local-vimeo-thumb.jpg", alt: "Vimeo: city timelapse" },
+    { type: "vimeo", src: "https://vimeo.com/1112464020", poster: "media/image7.jpg", alt: "Vimeo: city timelapse" },
     { type: "image", src: "media/image4.jpg", alt: "Lake reflection" }
   ];
 
-  /* Apply CSS variables per config to avoid flashes */
+  /* Apply style vars ASAP */
   (function applyStyleVars(cfg){
     const r = document.documentElement.style;
     const s = cfg.styles;
@@ -120,7 +122,6 @@
     r.setProperty('--preview-play-circle-size-d', s.playButton.preview.circleDesktop + 'px');
     r.setProperty('--preview-play-circle-size-m', s.playButton.preview.circleMobile + 'px');
     r.setProperty('--preview-play-icon-size', s.playButton.preview.iconSize);
-    // default host play config (overridden per host)
     r.setProperty('--play-btn-size-d', s.playButton.main.btnDesktop + 'px');
     r.setProperty('--play-btn-size-m', s.playButton.main.btnMobile + 'px');
     r.setProperty('--play-circle-size-d', s.playButton.main.circleDesktop + 'px');
@@ -150,7 +151,7 @@
   const vimeoMiniMap = new Map();
   const VIMEO_PLACEHOLDER = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675"><rect width="1200" height="675" fill="#111"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#666" font-family="Arial" font-size="42">Loading…</text></svg>`);
 
-  /* Utilities */
+  /* Utilities & validators */
   const isVideo = (el) => el && el.tagName && el.tagName.toLowerCase() === 'video';
   const mediaOf = (previewEl) => previewEl && previewEl.querySelector && previewEl.querySelector('img,video');
   const getPreviewType = (p) => (p && p.dataset && (p.dataset.type||'image')).toLowerCase();
@@ -162,15 +163,6 @@
     gsap.fromTo(overlay, { scale: 0.6, opacity: 0 }, { scale: 1.05, opacity: 1, duration: 0.18, ease: "back.out(3)", onComplete: () => gsap.to(overlay, { scale: 1, duration: 0.06, ease: "power1.out" }) });
   };
 
-  function withTimeout(promiseFactory, ms) {
-    return new Promise((resolve, reject) => {
-      let timedOut = false;
-      const t = setTimeout(() => { timedOut = true; reject(new Error('timeout')); }, ms);
-      promiseFactory().then(r => { if (!timedOut) { clearTimeout(t); resolve(r); } }).catch(err => { if (!timedOut) { clearTimeout(t); reject(err); } });
-    });
-  }
-
-  /* Validators */
   function validateImageUrl(url, timeout = CONFIG.behavior.validationTimeouts.image) {
     return new Promise(resolve => {
       if (!url) { resolve(false); return; }
@@ -216,7 +208,7 @@
     } catch (e) { return null; }
   }
 
-  /* Sizing helpers (used for videos and new image auto-scale) */
+  /* Sizers & helpers */
   function sizeHostToAspect(container, host, aspect) {
     if (!container || !host || !aspect) return;
     const boxW = container.clientWidth;
@@ -259,7 +251,7 @@
     iframe.style.position = "absolute"; iframe.style.top = "50%"; iframe.style.left = "50%"; iframe.style.transform = "translate(-50%,-50%)";
   }
 
-  /* Cleanup / helper functions */
+  /* Cleanup */
   function destroyVimeoPlayersIn(node) {
     const iframes = node.querySelectorAll("iframe[data-vimeo-iframe='1']");
     if (!iframes.length) return;
@@ -288,7 +280,7 @@
     if (player) { try { player.pause(); } catch (e) { } }
   }
 
-  /* Idle/preview logic for local video (with loop limit) */
+  /* Idle preview for local video with loop limit - improved to fade proxy on 'playing' event */
   const clearMainIdleAndPreview = () => {
     if (mainIdleTimer) { clearTimeout(mainIdleTimer); mainIdleTimer = null; }
     if (mainVideoEl) {
@@ -311,6 +303,7 @@
       } catch (e) { }
     }
   };
+
   const attachIdleLogicToVideo = (v, index, scope) => {
     if (scope === "main") { clearMainIdleAndPreview(); mainVideoEl = v; } else { clearLightboxIdleAndPreview(); lightboxVideoEl = v; }
     v.controls = false; v.playsInline = true; v.preload = "auto";
@@ -321,20 +314,18 @@
     const onEnded = () => { v._hasEndedPlaying = true; if (v._previewLoopActive) { v._previewLoopActive = false; v.removeEventListener("timeupdate", v._previewTimeHandler); } };
     v.addEventListener("ended", onEnded);
 
+    // when starting preview we will:
+    //  - leave a poster-proxy (if present) visible UNTIL the video is actually playing frames (use 'playing' event)
     const startPreview = () => {
       try {
         v.muted = true; v.controls = false; v._previewLoopActive = true; v.currentTime = 0;
         const proxy = v.parentElement && v.parentElement.querySelector('.poster-proxy');
-        let fadedProxy = false;
         v._previewTimeHandler = function () {
-          if (!fadedProxy && v.currentTime > 0.05) {
-            fadedProxy = true;
-            if (proxy) { gsap.to(proxy, { opacity: 0, duration: 0.25, onComplete: () => { try { proxy.remove(); } catch (e) { } } }); }
-          }
+          // loop counting handled here
           if (v.currentTime >= PREVIEW_DURATION) {
             v._loopCount = (v._loopCount || 0) + 1;
             if (loopLimit > 0 && v._loopCount >= loopLimit) {
-              // reached limit -> stop looping and fade back to poster
+              // reached limit -> stop looping and fade back to poster-proxy (prefer poster-proxy's src)
               try {
                 v._previewLoopActive = false;
                 v.removeEventListener("timeupdate", v._previewTimeHandler);
@@ -347,8 +338,21 @@
             try { v.currentTime = 0; v.play().catch(() => { }); } catch (e) { }
           }
         };
+
+        // ensure we fade proxy only when actual frames available - attach 'playing'
+        const onPlaying = () => {
+          try {
+            // fade video in and fade out poster proxy
+            gsap.fromTo(v, { opacity: 0 }, { opacity: 1, duration: 0.28 });
+            if (proxy) gsap.to(proxy, { opacity: 0, duration: 0.25, onComplete: () => { try { proxy.remove(); } catch (e) { } } });
+          } catch (e) { }
+          // remove listener after invoked once
+          v.removeEventListener('playing', onPlaying);
+        };
+        v.addEventListener('playing', onPlaying);
+
         v.addEventListener("timeupdate", v._previewTimeHandler);
-        gsap.fromTo(v, { opacity: 0 }, { opacity: 1, duration: 0.28 });
+        // start play; the 'playing' event will handle the fade-in
         v.play().catch(() => { });
       } catch (e) { }
     };
@@ -384,16 +388,25 @@
     };
   };
 
-  /* Vimeo idle preview with loop count enforcement */
+  /* Vimeo idle preview - keep poster priority; store preview ref on host to allow reuse on play */
   async function attachIdleLogicToVimeo(host, previewEl, scope) {
     clearVimeoIdle(scope);
     host._idleEnabled = true;
 
     const vimeoUrl = previewEl.dataset.src || previewEl.dataset.vimeo || "";
-    const meta = await fetchVimeoMeta(vimeoUrl) || { ratio: 16 / 9 };
+    const meta = await fetchVimeoMeta(vimeoUrl) || { ratio: 16 / 9, thumb: null };
     const ratio = meta.ratio || 16 / 9;
 
+    // pick poster: prefer previewEl.dataset.mainPoster (local poster) then cached meta then placeholder
+    let poster = previewEl.dataset.mainPoster || vimeoPosterCache.get(vimeoUrl) || meta.thumb || VIMEO_PLACEHOLDER;
     const posterImg = host.querySelector('img');
+    posterImg.src = poster;
+    posterImg.alt = previewEl.dataset.alt || 'Vimeo poster';
+
+    // store ratio, poster on host for later usage
+    host._vimeoPoster = poster;
+    host._vimeoRatio = ratio;
+
     const waitPoster = new Promise((resolve) => {
       const src = posterImg && posterImg.getAttribute('src');
       if (!src) { resolve(); return; }
@@ -406,10 +419,12 @@
     await waitPoster;
     if (!document.body.contains(host) || !host._idleEnabled) return;
 
-    const ref = { idleTimer: null, player: null, iframe: null, ro: null, loopCount: 0 };
+    const ref = { idleTimer: null, player: null, iframe: null, ro: null, loopCount: 0, ratio };
+    host._vimeoPreviewRef = ref;
     if (scope === "main") mainVimeoRef = ref; else lightboxVimeoRef = ref;
     const loopLimit = CONFIG.behavior.loopLimits[scope] ?? 0;
 
+    // schedule idle preview
     ref.idleTimer = setTimeout(async () => {
       if (!document.body.contains(host) || !host._idleEnabled) return;
       const id = extractVimeoId(vimeoUrl);
@@ -426,26 +441,33 @@
       host.appendChild(iframe);
       const player = new Vimeo.Player(iframe);
       ref.player = player; ref.iframe = iframe;
+      // keep fit updated
       const fit = () => containIframeToBox(iframe, ratio);
       const ro = new ResizeObserver(fit);
       ro.observe(host);
       ref.ro = ro; setTimeout(fit, 0);
+
+      // fade in the iframe when it provides frames (timeupdate), and hide poster image behind it
       let shown = false;
       player.on('timeupdate', (data) => {
         if (!host._idleEnabled) { try { player.pause(); } catch (e) { } return; }
         if (!shown && data && typeof data.seconds === 'number') {
-          shown = true; gsap.to(iframe, { opacity: 1, duration: 0.25 });
+          shown = true;
+          // fade the iframe in and hide poster
+          gsap.to(iframe, { opacity: 1, duration: 0.25 });
+          gsap.to(posterImg, { opacity: 0, duration: 0.25, onComplete: () => { try { posterImg.style.display = 'none'; } catch(e){} } });
         }
         if (data && data.seconds >= PREVIEW_DURATION) {
           ref.loopCount = (ref.loopCount || 0) + 1;
           if (loopLimit > 0 && ref.loopCount >= loopLimit) {
-            // stop and restore poster
+            // stop and restore poster (prefer local poster if set)
             try {
               host._idleEnabled = false;
-              player.pause().catch(() => { }); // stop player
+              player.pause().catch(() => { });
               if (iframe.parentElement) iframe.parentElement.removeChild(iframe);
               if (ref.ro) { try { ref.ro.disconnect(); } catch (e) { } }
-              if (posterImg) { gsap.to(posterImg, { opacity: 1, duration: 0.2 }); }
+              const preferredPoster = previewEl.dataset.mainPoster || meta.thumb || VIMEO_PLACEHOLDER;
+              if (posterImg) { posterImg.style.display = ''; posterImg.src = preferredPoster; posterImg.style.opacity = '1'; }
               return;
             } catch (e) { }
           }
@@ -454,20 +476,21 @@
       });
       try { await player.setMuted(true); } catch (e) { }
       try { await player.play().catch(() => { }); } catch (e) { }
+      // attach stop function that can be called externally (keeps iframe if we want to reuse)
       host._stopVimeoPreviewAndIdle = () => {
         host._idleEnabled = false;
         try {
           if (ref.idleTimer) { clearTimeout(ref.idleTimer); ref.idleTimer = null; }
+          // keep iframe in place (do not remove) if we intend to reuse; but allow caller to remove
           if (ref.player) { ref.player.pause().catch(() => { }); }
           if (ref.ro) { try { ref.ro.disconnect(); } catch (e) { } }
-          if (iframe && iframe.parentElement) { iframe.parentElement.removeChild(iframe); }
         } catch (e) { }
         if (scope === "main") mainVimeoRef = null; else lightboxVimeoRef = null;
       };
     }, IDLE_TIMEOUT);
   }
 
-  /* Play overlay helper and out-animation then callback */
+  /* Play overlay builder + out animation helper */
   function buildPlayOverlay(onClick) {
     const overlay = document.createElement("div");
     overlay.className = "play-btn";
@@ -486,7 +509,7 @@
     });
   }
 
-  /* Local video play (same as before) */
+  /* Local video play flow */
   function playVideoOverlay(videoEl, overlayEl) {
     if (!videoEl) return;
     try {
@@ -509,7 +532,7 @@
     } catch (e) { }
   }
 
-  /* Host play var application (so main vs lightbox play sizes are configurable) */
+  /* Host play var application */
   function applyHostPlayVars(host, scope) {
     const s = CONFIG.styles.playButton;
     if (scope === "lightbox") {
@@ -527,7 +550,7 @@
     }
   }
 
-  /* Local video host builder (unchanged except apply host vars and loop-limit already in idle logic) */
+  /* Create hosts */
   function createLocalVideoHost(srcNodeOrUrl, scope, posterFallback, animateOverlay = true, alt = "") {
     const host = document.createElement("div");
     host.className = "video-host media-host";
@@ -544,12 +567,16 @@
     v.style.objectFit = "contain"; v.style.background = "transparent"; v.style.borderRadius = "var(--border-radius)";
     host.appendChild(v);
 
+    // ALWAYS add a poster-proxy on main and lightbox to allow smooth fadebacks and to ensure we can restore local poster
+    const proxy = document.createElement('img');
+    proxy.className = 'poster-proxy';
+    proxy.alt = alt || 'Video poster';
+    proxy.src = v.poster || VIMEO_PLACEHOLDER;
+    Object.assign(proxy.style, { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'center', borderRadius: 'var(--border-radius)', zIndex: 2 });
+    host.appendChild(proxy);
+
     if (scope === "lightbox") {
-      const proxy = document.createElement('img');
-      proxy.className = 'poster-proxy'; proxy.alt = alt || 'Video poster';
-      proxy.src = v.poster || VIMEO_PLACEHOLDER;
-      Object.assign(proxy.style, { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'center', borderRadius: 'var(--border-radius)' });
-      host.appendChild(proxy);
+      // ensure responsive auto-sizer by video metadata later
       let aspect = null;
       v.addEventListener("loadedmetadata", () => { aspect = (v.videoWidth && v.videoHeight) ? (v.videoWidth / v.videoHeight) : (16 / 9); attachResponsiveSizer(imgBox, host, () => aspect || 16 / 9); });
       attachResponsiveSizer(imgBox, host, () => aspect || 16 / 9);
@@ -563,7 +590,6 @@
     return host;
   }
 
-  /* Vimeo host: overlay animates out then mount iframe/player (ensures out animation visible) */
   function createVimeoHost(previewEl, scope, animateOverlay = true, alt = "") {
     clearVimeoIdle(scope);
     const host = document.createElement("div");
@@ -577,6 +603,7 @@
     posterImg.style.borderRadius = 'var(--border-radius)';
     posterImg.style.objectPosition = 'center';
     posterImg.style.objectFit = (scope === "lightbox") ? 'cover' : 'contain';
+    posterImg.style.zIndex = 1;
     host.appendChild(posterImg);
 
     (async () => {
@@ -584,9 +611,9 @@
       let poster = previewEl.dataset.mainPoster || vimeoPosterCache.get(vimeoUrl);
       if (!poster) {
         poster = await resolveVimeoPosterForMain(previewEl);
-        if (poster) { await validateImageUrl(poster, 3000); vimeoPosterCache.set(vimeoUrl, poster); previewEl.dataset.mainPoster = poster; }
+        if (poster) { try { vimeoPosterCache.set(vimeoUrl, poster); previewEl.dataset.mainPoster = poster; } catch(e){} }
       }
-      if (poster) { posterImg.src = poster; }
+      if (poster) { posterImg.src = poster; host._vimeoPoster = poster; }
       if (scope === "lightbox") {
         const meta = await fetchVimeoMeta(vimeoUrl);
         const ratio = meta && meta.ratio ? meta.ratio : (16 / 9);
@@ -596,21 +623,35 @@
     })();
 
     const overlay = buildPlayOverlay((overlayEl) => {
-      host._idleEnabled = false;
-      if (typeof host._stopVimeoPreviewAndIdle === "function") try { host._stopVimeoPreviewAndIdle(); } catch (e) { }
+      // If an idle preview is already running and stored on host, reuse its player: unmute and play.
+      const ref = host._vimeoPreviewRef;
+      if (ref && ref.player && ref.iframe) {
+        // fade overlay out then unmute existing preview player (no iframe reinsert) — avoids flash
+        animateOverlayOutThen(overlayEl, async () => {
+          try {
+            await ref.player.setMuted(false).catch(()=>{});
+            await ref.player.play().catch(()=>{});
+            // if the poster image was visible, hide it (posterImg)
+            try { posterImg.style.display = 'none'; gsap.to(ref.iframe, { opacity: 1, duration: 0.18 }); } catch(e){}
+          } catch (e) { }
+        });
+        return;
+      }
 
-      // animate out first then mount iframe/player
+      // otherwise fallback to creating a fresh full player (no preview reuse available)
       animateOverlayOutThen(overlayEl, async () => {
         const vimeoUrl = previewEl.dataset.src || previewEl.dataset.vimeo || "";
         const id = extractVimeoId(vimeoUrl);
         if (!id) return;
+        // replace host content with a fresh iframe (unmuted) so player shows controls / unmuted content
+        host.innerHTML = "";
         const iframe = document.createElement("iframe");
         iframe.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
         iframe.setAttribute("data-vimeo-iframe", "1");
         iframe.style.width = "100%"; iframe.style.height = "100%"; iframe.style.border = "0";
         const params = new URLSearchParams({ autoplay: 1, muted: 0, title: 0, byline: 0, portrait: 0, playsinline: 1 });
-        host.innerHTML = ""; host.appendChild(iframe);
         iframe.src = `https://player.vimeo.com/video/${id}?${params.toString()}`;
+        host.appendChild(iframe);
         try {
           const player = new Vimeo.Player(iframe);
           vimeoPlayerMap.set(iframe, player);
@@ -623,7 +664,7 @@
     return host;
   }
 
-  /* Vimeo mini (preview strip) with loop limits and poster fallback */
+  /* Vimeo mini build (preview strip) */
   async function buildVimeoMini(previewEl, alt = "") {
     const vimeoUrl = previewEl.dataset.src || previewEl.dataset.vimeo || "";
     const id = extractVimeoId(vimeoUrl);
@@ -645,7 +686,9 @@
     const meta = await fetchVimeoMeta(vimeoUrl);
     const ratio = meta && meta.ratio ? meta.ratio : (16 / 9);
     const thumb = meta && meta.thumb;
-    if (thumb && await validateImageUrl(thumb, CONFIG.behavior.validationTimeouts.thumb)) { posterImg.src = thumb; }
+    // if a local poster was previously set and validated, prefer it (previewEl.dataset.mainPoster)
+    const preferredPoster = previewEl.dataset.mainPoster || thumb || VIMEO_PLACEHOLDER;
+    if (preferredPoster && await validateImageUrl(preferredPoster, CONFIG.behavior.validationTimeouts.thumb)) { posterImg.src = preferredPoster; }
 
     const params = new URLSearchParams({ autoplay: 1, muted: 1, controls: 0, loop: 0, title: 0, byline: 0, portrait: 0, dnt: 1, playsinline: 1 });
     const iframe = document.createElement('iframe');
@@ -677,9 +720,11 @@
         if (data.seconds >= PREVIEW_DURATION) {
           state.loopCount++;
           if (loopLimit > 0 && state.loopCount >= loopLimit) {
-            // stop player and restore poster
             try {
+              // stop player and restore poster -> prefer previewEl.dataset.mainPoster if available
               player.pause().catch(() => { });
+              const fallback = previewEl.dataset.mainPoster || thumb || VIMEO_PLACEHOLDER;
+              posterImg.src = fallback;
               posterImg.style.opacity = '1';
               if (iframe.parentElement) iframe.parentElement.removeChild(iframe);
               return;
@@ -707,7 +752,7 @@
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { vimeoMiniMap.forEach(({ keepPlaying }) => keepPlaying && keepPlaying()); } });
   window.addEventListener('focus', () => { vimeoMiniMap.forEach(({ keepPlaying }) => keepPlaying && keepPlaying()); });
 
-  /* Local preview loops for local preview videos. Implement loop limits similar to others. */
+  /* Local preview loops */
   function initLocalStripLoops() {
     previews.forEach((p) => {
       if (getPreviewType(p) !== "video") return;
@@ -723,13 +768,11 @@
         if (pv.currentTime >= PREVIEW_DURATION) {
           pv._loopCount = (pv._loopCount || 0) + 1;
           if (loopLimit > 0 && pv._loopCount >= loopLimit) {
-            // stop looping -> fade to poster (if poster exists)
             try {
-              pv.pause();
-              pv.currentTime = 0;
-              const poster = pv.getAttribute('poster');
+              pv.pause(); pv.currentTime = 0;
+              // restore poster using preview's dataset.poster (strict local poster) if available
+              const poster = p.dataset.poster || pv.getAttribute('poster');
               if (poster) {
-                // if parent's poster-proxy exists, show it
                 let proxy = p.querySelector('.poster-proxy');
                 if (!proxy && poster) {
                   proxy = document.createElement('img');
@@ -749,7 +792,7 @@
     });
   }
 
-  /* Kick previews if autoplay blocked */
+  /* Kick previews on first user gesture */
   window.addEventListener("pointerdown", () => {
     previews.forEach(p => {
       const v = p.querySelector("video"); try { if (v && v.paused) v.play().catch(() => { }); } catch (e) { }
@@ -757,9 +800,10 @@
     });
   }, { once: true });
 
-  /* Helpers for transition animations */
+  /* Transition helpers */
   const scrollPreviewIntoView = (idx, dur = 0.5) => {
     const el = previews[idx];
+    if (!el) return;
     const target = el.offsetLeft - (previewContainer.clientWidth / 2 - el.clientWidth / 2);
     gsap.to(previewContainer, { scrollLeft: target, duration: dur, ease: "power2.inOut" });
   };
@@ -785,8 +829,7 @@
     return cloneForAnim(node);
   }
 
-  /* Main + lightbox wiring */
-
+  /* Main & lightbox click handlers (lightbox close only when clicking outside media host) */
   function buildPlayOverlayForHost(host, onPlay) {
     const overlay = buildPlayOverlay(onPlay);
     host.appendChild(overlay);
@@ -817,25 +860,15 @@
     }
   };
 
-  // IMPORTANT: handleGalleryClick now closes lightbox only when clicking outside the visible media
   const handleGalleryClick = (e) => {
     if (!galleryViewer.classList.contains("active")) return;
-
-    // If click on arrows or close, ignore (they have their own handlers)
     if (e.target.closest('.arrows') || e.target.closest('.prev') || e.target.closest('.next') || e.target.closest('.close')) return;
-
-    // Determine actual displayed media element inside imgBox
     const media = imgBox.querySelector('img,video,iframe');
     if (media) {
-      // If click on the media itself (or any descendant), do NOT close
       if (media.contains(e.target) || e.target === media) return;
-      // If click inside the media host area (i.e. the host whose size is exactly the visible image frame),
-      // treat that as clicking the media (do not close)
       const mediaHost = imgBox.querySelector('.media-host');
       if (mediaHost && mediaHost.contains(e.target)) return;
     }
-
-    // Otherwise (click outside media / in backdrop), close
     closeLightbox();
   };
 
@@ -890,7 +923,7 @@
           const tl = gsap.timeline({ onComplete: () => {
             wrapper.innerHTML = ""; setMainMedia(currentIndex);
             previews.forEach(p => p.classList.remove("active")); previews[currentIndex].classList.add("active");
-          }});
+          } });
           tl.addLabel("start")
             .to(fromMedia, { x: direction > 0 ? "-100%" : "100%", duration: 0.5, ease: "power2.inOut" }, "start")
             .to(toMedia, { x: "0%", duration: 0.5, ease: "power2.inOut" }, "start")
@@ -906,7 +939,7 @@
     });
   }
 
-  /* updateSlide now implements image auto-scaling by aspect in lightbox, and keeps previous features for video/vimeo */
+  /* updateSlide: image auto-scale + existing behaviors preserved */
   function updateSlide(animateIn = false) {
     cleanupLightboxHost();
     destroyVimeoPlayersIn(imgBox);
@@ -921,7 +954,7 @@
       hostOrNode = createLocalVideoHost(node, "lightbox", node?.getAttribute("poster") || "", false, previewEl.dataset.alt || "Video");
     } else if (type === "vimeo") {
       hostOrNode = createVimeoHost(previewEl, "lightbox", false, previewEl.dataset.alt || "Vimeo video");
-    } else { // IMAGE: create a host sized to image's intrinsic ratio
+    } else { // IMAGE
       const original = mediaOf(previewEl);
       const host = document.createElement('div');
       host.className = 'media-host img-host';
@@ -938,7 +971,6 @@
       img.style.objectFit = 'contain';
       img.style.borderRadius = 'var(--border-radius)';
 
-      // Prefer original src if available
       if (original && original.tagName && original.tagName.toLowerCase() === 'img') img.src = original.src;
       else img.src = (original && original.getAttribute && (original.getAttribute('src') || original.src)) || '';
 
@@ -946,7 +978,6 @@
       imgBox.appendChild(host);
       hostOrNode = host;
 
-      // get intrinsic ratio (wait for load)
       const applyAspect = () => {
         const w = img.naturalWidth, h = img.naturalHeight;
         const ratio = (w && h) ? (w / h) : (16 / 9);
@@ -980,7 +1011,7 @@
     }});
   }
 
-  /* Keyboard and touch (unchanged behavior, space toggles Vimeo too) */
+  /* Keyboard + touch */
   document.addEventListener("keydown", (e) => {
     const active = document.activeElement;
     if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return;
@@ -1020,16 +1051,22 @@
     if (item.type === 'image') {
       const img = document.createElement('img'); img.src = (item.thumbValid ? item.thumb : item.src); img.alt = item.alt || 'Image'; p.appendChild(img);
     } else if (item.type === 'video') {
-      const vid = document.createElement('video'); vid.src = item.src; if (item.posterValid && item.poster) vid.setAttribute('poster', item.poster);
+      const vid = document.createElement('video'); vid.src = item.src;
+      if (item.posterValid && item.poster) {
+        vid.setAttribute('poster', item.poster);
+        p.dataset.poster = item.poster; // store poster so loop-stop logic can prefer this
+      }
       vid.muted = true; vid.playsInline = true; vid.preload = 'auto'; vid.setAttribute('aria-label', item.alt || 'Video'); p.appendChild(vid);
       const overlay = document.createElement('span'); overlay.className = 'play-overlay'; overlay.innerHTML = '<span class="circle"><i class="fa-solid fa-play"></i></span>'; p.appendChild(overlay);
     } else if (item.type === 'vimeo') {
-      p.dataset.src = item.src; if (item.posterValid && item.poster) p.dataset.poster = item.poster; if (item._metaResolved) p.dataset._metaResolved = "1";
+      p.dataset.src = item.src;
+      if (item.posterValid && item.poster) { p.dataset.poster = item.poster; p.dataset.mainPoster = item.poster; } // strictly prefer local poster
+      if (item._metaResolved) p.dataset._metaResolved = "1";
     }
     return p;
   }
 
-  /* Wire preview clicks for transitions (keeps behaviour consistent) */
+  /* Wire preview clicks for transitions */
   function wirePreviewClicks() {
     previews.forEach((preview, index) => {
       preview.addEventListener("click", () => {
@@ -1063,9 +1100,9 @@
     });
   }
 
-  /* Resolve vimeo poster for main (local poster preferred), used for avoiding flashes */
+  /* Resolve vimeo poster for main: prefer local poster strictly, otherwise vimeo thumb */
   async function resolveVimeoPosterForMain(previewEl) {
-    const localPoster = previewEl.dataset.poster || "";
+    const localPoster = previewEl.dataset.poster || previewEl.dataset.mainPoster || "";
     if (localPoster) {
       const valid = await validateImageUrl(localPoster, CONFIG.behavior.validationTimeouts.poster);
       if (valid) return localPoster;
@@ -1105,7 +1142,7 @@
     }
   }
 
-  /* Set main media (keeps previous logic + uses new host builders) */
+  /* Set main media - uses strict local poster when available (createPreviewFromItem sets dataset.poster) */
   function setMainMedia(index) {
     const previewEl = previews[index];
     if (!previewEl) return;
@@ -1119,7 +1156,7 @@
     if (type === "video" && srcNode) {
       mainImageBox.style.background = "black";
       const alt = previewEl.dataset.alt || "Video";
-      mainImageBox.appendChild(createLocalVideoHost(srcNode, "main", srcNode?.getAttribute("poster") || "", true, alt));
+      mainImageBox.appendChild(createLocalVideoHost(srcNode, "main", previewEl.dataset.poster || srcNode?.getAttribute("poster") || "", true, alt));
       clearVimeoIdle("main");
     } else if (type === "vimeo") {
       mainImageBox.style.background = "black";
@@ -1138,7 +1175,7 @@
     }
   }
 
-  /* Validation logic (vimeo accepted if ID valid even if meta fetch fails) */
+  /* Validation */
   async function validateItem(item) {
     const t = (item.type || 'image').toLowerCase();
     if (t === 'image') {
@@ -1169,57 +1206,108 @@
     return null;
   }
 
-  /* Boot: progressive load, skeleton -> replace slots as validations resolve */
+  /* PRELOAD helper */
+  function preloadMediaForValidatedItems(validatedItems) {
+    validatedItems.forEach(itemEl => {
+      const type = getPreviewType(itemEl);
+      try {
+        if (type === 'image') {
+          const img = itemEl.querySelector('img');
+          if (img) { const p = new Image(); p.src = img.src; }
+        } else if (type === 'video') {
+          const v = itemEl.querySelector('video');
+          if (v) { try { const pv = document.createElement('video'); pv.preload = 'metadata'; pv.src = v.getAttribute('src') || v.src; pv.load(); } catch (e) { } }
+        } else if (type === 'vimeo') {
+          const vurl = itemEl.dataset.src || itemEl.dataset.vimeo;
+          if (vurl) { fetchVimeoMeta(vurl).then(meta => { if (meta && meta.thumb) { const i = new Image(); i.src = meta.thumb; } }).catch(()=>{}); }
+        }
+      } catch (e) { }
+    });
+  }
+
+  /* Boot: deterministic, await validations then build previews (ensures first-load completeness) */
   async function boot() {
     previewContainer.innerHTML = '';
+    // create skeleton placeholders
     const skeletonSlots = GALLERY_DATA.map(() => createPreviewShell());
     skeletonSlots.forEach(s => previewContainer.appendChild(s));
 
-    const tasks = GALLERY_DATA.map((item, idx) => validateItem(item).then(res => ({ idx, res })).catch(() => ({ idx, res: null })));
-    let firstMainSet = false;
+    // validate all items in parallel
+    const validationPromises = GALLERY_DATA.map((item, idx) =>
+      validateItem(item).then(res => ({ idx, res, original:item })).catch(() => ({ idx, res: null, original:item }))
+    );
 
-    for (const t of tasks) {
-      t.then(({ idx, res }) => {
-        const slot = previewContainer.children[idx];
-        if (res) {
-          const newPrev = createPreviewFromItem(res);
-          previews[idx] = newPrev;
-          if (slot) previewContainer.replaceChild(newPrev, slot); else previewContainer.appendChild(newPrev);
+    // Await all validations so first load builds completely
+    const results = await Promise.all(validationPromises);
 
-          if (res.type === 'vimeo' && res._metaMissing) {
-            setTimeout(() => attemptVimeoMetaRecovery(newPrev), CONFIG.behavior.vimeoMetaRetryDelay);
-          }
-          if (!firstMainSet) {
-            firstMainSet = true;
-            currentIndex = idx;
-            newPrev.classList.add('active');
-            setMainMedia(idx);
-          }
-          const validCount = Array.from(previewContainer.children).filter(c => !c.classList.contains('skeleton')).length;
-          if (validCount >= 2) { previewContainer.classList.add('visible'); previewContainer.classList.remove('hidden'); }
-        } else {
-          if (slot && slot.parentElement) slot.parentElement.removeChild(slot);
-          previews[idx] = undefined;
+    previewContainer.innerHTML = ''; // clear skeletons
+    previews = [];
+    const validatedPreviewElements = [];
+
+    // Build previews only for validated items (in original order)
+    for (const r of results) {
+      const res = r.res;
+      const item = r.original;
+      if (res) {
+        // Accept and create preview DOM
+        const newPrev = createPreviewFromItem(res);
+        // store local poster as mainPoster for vimeo strictly if valid
+        if (res.type === 'vimeo' && res.posterValid && res.poster) {
+          newPrev.dataset.mainPoster = res.poster;
         }
-      });
+        // for video ensure dataset.poster is set (already done in createPreviewFromItem)
+        previewContainer.appendChild(newPrev);
+        previews.push(newPrev);
+        validatedPreviewElements.push(newPrev);
+
+        // if vimeo meta missing schedule recovery
+        if (res.type === 'vimeo' && res._metaMissing) {
+          setTimeout(() => attemptVimeoMetaRecovery(newPrev), CONFIG.behavior.vimeoMetaRetryDelay);
+        }
+      } else {
+        // Skip invalid item (no slot appended)
+      }
     }
 
-    Promise.allSettled(tasks).then(async () => {
-      previews = Array.from(previewContainer.children);
-      if (previews.length <= 1) { previewContainer.classList.remove('visible'); previewContainer.classList.add('hidden'); }
-      else { previewContainer.classList.remove('hidden'); previewContainer.classList.add('visible'); }
+    // if <=1 valid items -> hide preview strip
+    if (previews.length <= 1) {
+      previewContainer.classList.remove('visible');
+      previewContainer.classList.add('hidden');
+    } else {
+      previewContainer.classList.remove('hidden');
+      previewContainer.classList.add('visible');
+    }
 
-      wirePreviewClicks();
-      const startVimeoMinis = () => initVimeoStripMiniPlayers().then(() => initLocalStripLoops());
-      if ('requestIdleCallback' in window) requestIdleCallback(startVimeoMinis, { timeout: 500 }); else setTimeout(startVimeoMinis, 0);
+    // determine initial focused index using config.startIndex (0-based among validated items)
+    let configured = Number.isInteger(CONFIG.behavior.startIndex) ? CONFIG.behavior.startIndex : 0;
+    if (configured < 0) configured = 0;
+    if (configured >= previews.length) configured = 0;
+    currentIndex = previews.length ? configured : 0;
+    // set active classes
+    previews.forEach(p => p.classList.remove('active'));
+    if (previews[currentIndex]) previews[currentIndex].classList.add('active');
 
-      previews.forEach(p => { if (getPreviewType(p) === 'vimeo' && p.dataset._metaResolved !== '1') attemptVimeoMetaRecovery(p); });
-    });
+    // show main media for initial index
+    if (previews.length) {
+      setMainMedia(currentIndex);
+      // scroll active preview into view after a short tick
+      setTimeout(() => scrollPreviewIntoView(currentIndex, 0.2), 80);
+    } else {
+      // nothing valid - show placeholder
+      mainImageBox.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#777">No media available</div>';
+    }
+
+    // now attach interactions and initialize preview players (run soon but not blocking the main thread)
+    wirePreviewClicks();
+    setTimeout(() => {
+      initVimeoStripMiniPlayers().then(() => initLocalStripLoops()).catch(()=>{});
+      preloadMediaForValidatedItems(validatedPreviewElements);
+    }, 0);
   }
 
   window.addEventListener("load", boot);
 
-  /* Lightbox control wiring - arrows and close */
+  /* Controls wiring (arrows/close) */
   nextBtn.addEventListener("click", (e) => { e.stopPropagation(); if (isAnimating) return; nextSlide(); });
   prevBtn.addEventListener("click", (e) => { e.stopPropagation(); if (isAnimating) return; prevSlide(); });
   closeBtn.addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
